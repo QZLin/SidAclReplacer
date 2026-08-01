@@ -131,6 +131,38 @@ Update-AclSid -Path C:\Data -SourceSid Everyone -TargetSid 'Authenticated Users'
 Get-ChildItem C:\Data -Recurse -File | Update-AclSid -SourceSid Everyone -TargetSid 'Authenticated Users' -PassThru
 ```
 
+## Remove-AclSid — 移除 SID 权限
+
+```powershell
+# 移除特定 SID 的所有 ACE
+Remove-AclSid -Path C:\Data -TargetSid S-1-5-21-xxx-xxx-xxx-1001 -Recurse
+
+# 仅移除 Deny 类型的 ACE
+Remove-AclSid -Path C:\Data -TargetSid S-1-5-21-xxx-xxx-xxx-1001 -AccessControlType Deny -Recurse
+
+# 移除所有无法解析的 SID（孤立 SID 清理）
+Remove-AclSid -Path C:\Data -AllUnknownSid -Recurse
+
+# WhatIf 预览
+Remove-AclSid -Path C:\Data -AllUnknownSid -Recurse -WhatIf -PassThru
+```
+
+### Remove-AclSid 参数
+
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `-Path` | `string[]` | 是 | 目标路径，支持通配符和管道输入 |
+| `-TargetSid` | `string` | 是* | 要移除的 SID（与 `-AllUnknownSid` 二选一） |
+| `-AllUnknownSid` | `switch` | 是* | 移除所有无法解析为账户名的 SID（孤立 SID） |
+| `-AccessControlType` | `string[]` | 否 | 过滤类型：`Allow` / `Deny`，默认两者 |
+| `-Recurse` | `switch` | 否 | 递归处理子目录和文件 |
+| `-IncludeInherited` | `switch` | 否 | 也移除继承的 ACE（默认仅移除显式 ACE） |
+| `-FollowReparsePoints` | `switch` | 否 | 递归时跟随重解析点（默认跳过） |
+| `-StopOnError` | `switch` | 否 | 遇到第一个错误时停止（默认继续处理） |
+| `-PassThru` | `switch` | 否 | 输出每个条目的处理结果对象 |
+
+> `*` `-TargetSid` 和 `-AllUnknownSid` 属于不同参数集，必须且只能使用其中一个。
+
 ## 输出对象（ReplaceResult）
 
 当使用 `-PassThru` 参数时，每个处理的条目会输出一个 `ReplaceResult` 对象：

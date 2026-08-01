@@ -144,12 +144,70 @@ if ($aceAfter.Count -gt 0) {
 # ---------- 测试结果判断 ----------
 Write-Host ""
 if ($totalReplaced -eq 6 -and $aceAfter.Count -gt 0 -and $aceOld.Count -eq 0) {
-    Write-Host "=== 所有测试通过! ===" -ForegroundColor Green
+    Write-Host "=== Update-AclSid 测试通过! ===" -ForegroundColor Green
 }
 else {
-    Write-Host "=== 测试结果: 总替换=$totalReplaced (预期6), 目标ACE=$($aceAfter.Count) (>0), 源ACE=$($aceOld.Count) (0) ===" -ForegroundColor Yellow
+    Write-Host "=== Update-AclSid 测试结果: 总替换=$totalReplaced (预期6), 目标ACE=$($aceAfter.Count) (>0), 源ACE=$($aceOld.Count) (0) ===" -ForegroundColor Yellow
     if ($totalReplaced -ne 6) { Write-Warning "替换数量不符合预期" }
     if ($aceOld.Count -ne 0) { Write-Warning "源 SID 的 ACE 仍然存在" }
+}
+
+# ---------- Remove-AclSid 测试 ----------
+Write-Host ""
+Write-Host "=== Remove-AclSid 测试 ===" -ForegroundColor Cyan
+
+# 重新创建测试目录，为 Everyone 和 Authenticated Users 设置 ACL
+if (Test-Path $TestRoot) { Remove-Item $TestRoot -Recurse -Force }
+New-Item -Path $TestRoot -ItemType Directory -Force | Out-Null
+New-Item -Path (Join-Path $TestRoot 'test.txt') -ItemType File -Force | Out-Null
+
+$everyoneId = [System.Security.Principal.SecurityIdentifier]::new($sourceSid)
+$authUsersId = [System.Security.Principal.SecurityIdentifier]::new($targetSid)
+
+$acl = Get-Acl $TestRoot
+$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($everyoneId, 'Read', 'None', 'None', 'Allow')
+$acl.AddAccessRule($rule)
+Set-Acl -Path $TestRoot -AclObject $acl
+
+$acl2 = Get-Acl $TestRoot
+$rule2 = [System.Security.AccessControl.FileSystemAccessRule]::new($authUsersId, 'Read', 'None', 'None', 'Allow')
+$acl2.AddAccessRule($rule2)
+Set-Acl -Path $TestRoot -AclObject $acl2
+
+Write-Host "[R1/5] Remove-AclSid -TargetSid -WhatIf" -ForegroundColor Yellow
+$r = Remove-AclSid -Path $TestRoot -TargetSid $sourceSid -WhatIf -PassThru
+Write-Host "  WhatIf: 移除 $($r.DaclAceReplaced) 个 ACE, 写入: $($r.Written)" -ForegroundColor Gray
+
+Write-Host "[R2/5] Remove-AclSid -TargetSid (实际移除 Everyone)" -ForegroundColor Yellow
+$r = Remove-AclSid -Path $TestRoot -TargetSid $sourceSid -PassThru
+Write-Host "  结果: 移除 $($r.DaclAceReplaced) 个 ACE, 成功: $($r.Success)"
+$rCount = $r.DaclAceReplaced
+
+Write-Host "[R3/5] 验证移除结果" -ForegroundColor Yellow
+$aclR = Get-Acl $TestRoot
+$everyoneRem = $aclR.Access | Where-Object { try { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $sourceSid } catch { $false } }
+$authUsersRem = $aclR.Access | Where-Object { try { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $targetSid } catch { $false } }
+Write-Host "  Everyone 残留: $($everyoneRem.Count) (预期 0)"
+Write-Host "  Authenticated Users 残留: $($authUsersRem.Count) (预期 1)"
+
+Write-Host "[R4/5] Remove-AclSid -AccessControlType Deny" -ForegroundColor Yellow
+$acl3 = Get-Acl $TestRoot
+$rule3 = [System.Security.AccessControl.FileSystemAccessRule]::new($everyoneId, 'Write', 'None', 'None', 'Deny')
+$acl3.AddAccessRule($rule3)
+Set-Acl -Path $TestRoot -AclObject $acl3
+$r2 = Remove-AclSid -Path $TestRoot -TargetSid $sourceSid -AccessControlType Deny -PassThru
+Write-Host "  移除 Deny 类型: $($r2.DaclAceReplaced) 个 ACE"
+
+Write-Host "[R5/5] Remove-AclSid -AllUnknownSid (WhatIf)" -ForegroundColor Yellow
+$r3 = Remove-AclSid -Path $TestRoot -AllUnknownSid -WhatIf -PassThru
+Write-Host "  AllUnknownSid WhatIf: 移除 $($r3.DaclAceReplaced) 个 ACE"
+
+# Remove-AclSid 测试结果
+$removePass = $rCount -eq 1 -and $everyoneRem.Count -eq 0 -and $authUsersRem.Count -eq 1
+if ($removePass) {
+    Write-Host "=== Remove-AclSid 测试通过! ===" -ForegroundColor Green
+} else {
+    Write-Host "=== Remove-AclSid 测试结果: 移除=$rCount (预期1), Everyone残留=$($everyoneRem.Count) (0), AuthUsers残留=$($authUsersRem.Count) (1) ===" -ForegroundColor Yellow
 }
 
 # ---------- 清理 ----------

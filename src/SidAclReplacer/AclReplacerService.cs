@@ -253,6 +253,280 @@ public sealed class AclReplacerService
     }
 
     /// <summary>
+    /// 从单个路径的 DACL 中移除匹配的 ACE。
+    /// </summary>
+    public ReplaceResult Remove(
+        string path,
+        SecurityIdentifier? targetSid,
+        bool allUnknownSid,
+        bool includeInherited,
+        bool whatIf,
+        string[] aceTypes)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = new ReplaceResult { Path = path };
+
+        try
+        {
+            bool isDir = Directory.Exists(path);
+            bool isFile = File.Exists(path);
+            if (!isDir && !isFile)
+            {
+                result.Success = false;
+                result.Error = "路径不存在";
+                sw.Stop();
+                result.ElapsedMilliseconds = sw.ElapsedMilliseconds;
+                return result;
+            }
+            result.EntryType = isDir ? "Directory" : "File";
+
+            // 读取 Owner + Group + Access 以完整保留安全描述符
+            var sections = AccessControlSections.Owner
+                          | AccessControlSections.Group
+                          | AccessControlSections.Access;
+
+            byte[] sdBytes;
+            if (isDir)
+            {
+                var ds = new DirectorySecurity(path, sections);
+                sdBytes = ds.GetSecurityDescriptorBinaryForm();
+            }
+            else
+            {
+                var fs = new FileSecurity(path, sections);
+                sdBytes = fs.GetSecurityDescriptorBinaryForm();
+            }
+
+            var rawSd = new RawSecurityDescriptor(sdBytes, 0);
+
+            // 移除 DACL 中的匹配 ACE
+            if (rawSd.DiscretionaryAcl != null)
+            {
+                var newDacl = new RawAcl(rawSd.DiscretionaryAcl.Revision, rawSd.DiscretionaryAcl.Count);
+                result.DaclAceReplaced = RemoveSidsFromAcl(
+                    rawSd.DiscretionaryAcl, newDacl, targetSid, allUnknownSid, includeInherited, aceTypes);
+                rawSd.DiscretionaryAcl = newDacl;
+            }
+
+            // Owner / Group 不处理
+
+            bool hasChanges = result.DaclAceReplaced > 0;
+            if (!hasChanges)
+            {
+                result.Success = true;
+                result.Written = false;
+                sw.Stop();
+                result.ElapsedMilliseconds = sw.ElapsedMilliseconds;
+                return result;
+            }
+
+            if (whatIf)
+            {
+                result.Success = true;
+                result.Written = false;
+                sw.Stop();
+                result.ElapsedMilliseconds = sw.ElapsedMilliseconds;
+                return result;
+            }
+
+            // 写回
+            byte[] newSdBytes = new byte[rawSd.BinaryLength];
+            rawSd.GetBinaryForm(newSdBytes, 0);
+
+            if (isDir)
+            {
+                var newDs = new DirectorySecurity();
+                newDs.SetSecurityDescriptorBinaryForm(newSdBytes);
+                new DirectoryInfo(path).SetAccessControl(newDs);
+            }
+            else
+            {
+                var newFs = new FileSecurity();
+                newFs.SetSecurityDescriptorBinaryForm(newSdBytes);
+                new FileInfo(path).SetAccessControl(newFs);
+            }
+
+            result.Success = true;
+            result.Written = true;
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            result.Success = false;
+            result.Error = $"访问被拒绝（需要管理员权限）：{ex.Message}";
+        }
+        catch (Exception ex)
+        {
+            result.Success = false;
+            result.Error = ex.Message;
+        }
+        finally
+        {
+            sw.Stop();
+            result.ElapsedMilliseconds = sw.ElapsedMilliseconds;
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 递归遍历目录树并移除每个条目中匹配的 ACE。
+    /// </summary>
+    public IEnumerable<ReplaceResult> RemoveRecursive(
+        string rootPath,
+        SecurityIdentifier? targetSid,
+        bool allUnknownSid,
+        bool includeInherited,
+        bool followReparsePoints,
+        bool stopOnError,
+        bool passThru,
+        string[] aceTypes)
+    {
+        yield return Remove(rootPath, targetSid, allUnknownSid, includeInherited, whatIf: false, aceTypes);
+
+        if (!Directory.Exists(rootPath))
+            yield break;
+
+        var stack = new Stack<string>();
+        stack.Push(rootPath);
+
+        while (stack.Count > 0)
+        {
+            var current = stack.Pop();
+
+            // 子目录
+            IEnumerable<string> dirs;
+            try
+            {
+                dirs = Directory.EnumerateDirectories(current, "*", SearchOption.TopDirectoryOnly);
+            }
+            catch (UnauthorizedAccessException) { continue; }
+            catch (DirectoryNotFoundException) { continue; }
+
+            foreach (var dir in dirs)
+            {
+                if (!followReparsePoints)
+                {
+                    try
+                    {
+                        var attrs = File.GetAttributes(dir);
+                        if ((attrs & FileAttributes.ReparsePoint) != 0)
+                            continue;
+                    }
+                    catch { }
+                }
+
+                var r = Remove(dir, targetSid, allUnknownSid, includeInherited, whatIf: false, aceTypes);
+                yield return r;
+
+                if (!r.Success && stopOnError)
+                    yield break;
+
+                stack.Push(dir);
+            }
+
+            // 文件
+            IEnumerable<string> files;
+            try
+            {
+                files = Directory.EnumerateFiles(current, "*", SearchOption.TopDirectoryOnly);
+            }
+            catch (UnauthorizedAccessException) { continue; }
+            catch (DirectoryNotFoundException) { continue; }
+
+            foreach (var file in files)
+            {
+                var r = Remove(file, targetSid, allUnknownSid, includeInherited, whatIf: false, aceTypes);
+                yield return r;
+
+                if (!r.Success && stopOnError)
+                    yield break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 从源 RawAcl 中移除匹配的 ACE，将剩余的 ACE 复制到目标 RawAcl。
+    /// </summary>
+    private static int RemoveSidsFromAcl(
+        RawAcl sourceAcl,
+        RawAcl destAcl,
+        SecurityIdentifier? targetSid,
+        bool allUnknownSid,
+        bool includeInherited,
+        string[] aceTypes)
+    {
+        int removed = 0;
+
+        for (int i = 0; i < sourceAcl.Count; i++)
+        {
+            var ace = sourceAcl[i];
+
+            // 跳过继承的 ACE（除非显式要求）
+            if (!includeInherited && (ace.AceFlags & AceFlags.Inherited) != 0)
+            {
+                destAcl.InsertAce(destAcl.Count, ace);
+                continue;
+            }
+
+            bool shouldRemove = false;
+            SecurityIdentifier? sid = null;
+
+            if (ace is CommonAce ca)
+                sid = ca.SecurityIdentifier;
+            else if (ace is ObjectAce oa)
+                sid = oa.SecurityIdentifier;
+
+            if (sid != null)
+            {
+                if (allUnknownSid)
+                {
+                    // 无法解析为账户名的 SID 视为"未知 SID"
+                    try
+                    {
+                        sid.Translate(typeof(NTAccount));
+                    }
+                    catch
+                    {
+                        shouldRemove = true;
+                    }
+                }
+                else if (targetSid != null && sid.Equals(targetSid))
+                {
+                    shouldRemove = true;
+                }
+            }
+
+            // 按 ACE 类型（Allow / Deny）过滤
+            if (shouldRemove && aceTypes.Length > 0)
+            {
+                var qualifier = (AceQualifier)(byte)ace.AceType;
+                bool matchesType = false;
+                foreach (var at in aceTypes)
+                {
+                    if (at.Equals("Allow", StringComparison.OrdinalIgnoreCase)
+                        && qualifier == AceQualifier.AccessAllowed)
+                        matchesType = true;
+                    else if (at.Equals("Deny", StringComparison.OrdinalIgnoreCase)
+                             && qualifier == AceQualifier.AccessDenied)
+                        matchesType = true;
+                }
+                shouldRemove = matchesType;
+            }
+
+            if (shouldRemove)
+            {
+                removed++;
+            }
+            else
+            {
+                destAcl.InsertAce(destAcl.Count, ace);
+            }
+        }
+
+        return removed;
+    }
+
+    /// <summary>
     /// 在 RawAcl 中原地替换所有匹配 sourceSid 的 ACE。
     /// 使用索引器赋值（acl[i] = newAce）保证 ACE 顺序不变。
     /// </summary>
