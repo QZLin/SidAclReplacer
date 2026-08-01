@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- netstandard2.0 兼容 Windows PowerShell 5.1 与 PowerShell 7+ -->
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <AssemblyName>SidAclReplacer</AssemblyName>
+    <RootNamespace>SidAclReplacer</RootNamespace>
+    <Description>NTFS ACL SID replacement tool — preserves ACE structure, inheritance, and canonical ordering.</Description>
+    <Authors>SidAclReplacer</Authors>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- PowerShellStandard.Library 提供 PSCmdlet / CmdletAttribute 等 API 表面，
+         实际实现由宿主 PowerShell 运行时提供，因此同一 DLL 可在 PS 5.1 与 PS 7+ 中加载 -->
+    <PackageReference Include="PowerShellStandard.Library" Version="5.1.1" PrivateAssets="all" />
+    <!-- System.IO.FileSystem.AccessControl 提供 DirectorySecurity / FileSecurity / RawSecurityDescriptor -->
+    <PackageReference Include="System.IO.FileSystem.AccessControl" Version="5.0.0" />
+  </ItemGroup>
+
+</Project>
