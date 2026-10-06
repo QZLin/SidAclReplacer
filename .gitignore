@@ -396,3 +396,13 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# ========== SidAclReplacer 项目特定 ==========
+
+# 模块目录中的构建产物（DLL），由 build.ps1 生成
+module/*.dll
+
+# 测试输出文件
+test_output.txt
+demo_output.txt
+test_remove_output.txt

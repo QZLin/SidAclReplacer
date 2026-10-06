@@ -440,7 +440,406 @@ function Update-AclSid {
     }
 }
 
+<#
+.SYNOPSIS
+    Remove a SID's permission records from NTFS file/directory ACLs.
+
+.DESCRIPTION
+    Remove-AclSid removes all ACE entries that match the specified SID from the
+    DACL (Discretionary Access Control List) of each target file or directory.
+
+    Two modes:
+      -TargetSid <SID>:  remove a specific SID's ACEs
+      -AllUnknownSid:    remove ACEs for any SID that cannot be resolved to a
+                         known account name (orphaned/unknown SID cleanup)
+
+    Owner and Group are NOT touched.
+
+.PARAMETER Path
+    Target file or directory path(s). Accepts pipeline input and wildcards.
+
+.PARAMETER TargetSid
+    The SID to remove. Accepts S-1-5-... string or DOMAIN\user account name.
+    Used in ByTargetSid parameter set.
+
+.PARAMETER AllUnknownSid
+    Remove ACEs for all SIDs that the system cannot resolve to an account name.
+    Used in AllUnknown parameter set.
+
+.PARAMETER AccessControlType
+    Filter by access control type. Valid values: "Allow", "Deny". Default: both.
+
+.PARAMETER Recurse
+    Recursively process all subdirectories and files.
+
+.PARAMETER IncludeInherited
+    Also remove inherited ACEs (default: only explicit ACEs).
+
+.PARAMETER FollowReparsePoints
+    Follow reparse points (symlinks, junctions) during recursion.
+
+.PARAMETER StopOnError
+    Stop on the first error instead of continuing.
+
+.PARAMETER PassThru
+    Output a result object for each processed entry.
+
+.EXAMPLE
+    Remove-AclSid -Path C:\Data -TargetSid S-1-5-21-xxx-xxx-xxx-1001 -Recurse
+
+    Remove all ACEs for a specific SID recursively.
+
+.EXAMPLE
+    Remove-AclSid -Path C:\Data -AllUnknownSid -Recurse -WhatIf
+
+    Preview removing all unknown SID ACEs.
+#>
+function Remove-AclSid {
+    [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'ByTargetSid')]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Position = 0, Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName, ParameterSetName = 'ByTargetSid')]
+        [Parameter(Position = 0, Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName, ParameterSetName = 'AllUnknown')]
+        [Alias('FullName', 'PSPath')]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$Path,
+
+        [Parameter(Mandatory, Position = 1, ParameterSetName = 'ByTargetSid')]
+        [Alias('Sid')]
+        [string]$TargetSid,
+
+        [Parameter(Mandatory, ParameterSetName = 'AllUnknown')]
+        [switch]$AllUnknownSid,
+
+        [Parameter()]
+        [ValidateSet('Allow', 'Deny')]
+        [string[]]$AccessControlType = @('Allow', 'Deny'),
+
+        [switch]$Recurse,
+        [switch]$IncludeInherited,
+        [switch]$FollowReparsePoints,
+        [switch]$StopOnError,
+        [switch]$PassThru
+    )
+
+    begin {
+        # ---------- 加载 ACL 类型 ----------
+        $aclTypes = @(
+            'System.Security.AccessControl.RawSecurityDescriptor'
+            'System.Security.AccessControl.RawAcl'
+            'System.Security.AccessControl.CommonAce'
+            'System.Security.AccessControl.ObjectCommonAce'
+            'System.Security.AccessControl.AceFlags'
+            'System.Security.AccessControl.AceQualifier'
+            'System.Security.AccessControl.AccessControlSections'
+            'System.Security.AccessControl.DirectorySecurity'
+            'System.Security.AccessControl.FileSecurity'
+            'System.Security.Principal.SecurityIdentifier'
+            'System.Security.Principal.NTAccount'
+        )
+        foreach ($t in $aclTypes) {
+            if (-not ($t -as [type])) {
+                try {
+                    Add-Type -AssemblyName 'System.IO.FileSystem.AccessControl' -ErrorAction Stop
+                } catch {}
+                break
+            }
+        }
+
+        # ---------- 解析 SID ----------
+        function ConvertTo-SecurityIdentifier {
+            param([string]$sid_text)
+            if ($sid_text -match '^S-1-\d') {
+                try {
+                    return [System.Security.Principal.SecurityIdentifier]::new($sid_text)
+                } catch {
+                    throw "无法解析 SID 字符串 '$sid_text': $($_.Exception.Message)"
+                }
+            }
+            try {
+                $nt = [System.Security.Principal.NTAccount]::new($sid_text)
+                return $nt.Translate([System.Security.Principal.SecurityIdentifier])
+            } catch {
+                throw "无法将 '$sid_text' 解析为 SID 或账户名。"
+            }
+        }
+
+        $allUnknown = $AllUnknownSid.IsPresent
+        $targetId = $null
+        if (-not $allUnknown) {
+            try {
+                $targetId = ConvertTo-SecurityIdentifier $TargetSid
+            } catch {
+                throw $_
+            }
+        }
+
+        Write-Verbose "移除模式: $(if ($allUnknown) { '所有未知 SID' } else { $targetId.Value })"
+        Write-Verbose "ACE 类型过滤: $($AccessControlType -join ', ')"
+
+        # ---------- 核心：从 RawAcl 中移除匹配的 ACE ----------
+        function Remove-SidsFromAcl {
+            param(
+                [System.Security.AccessControl.RawAcl]$SourceAcl,
+                [System.Security.Principal.SecurityIdentifier]$TargetId,
+                [bool]$AllUnknown,
+                [bool]$IncludeInherited,
+                [string[]]$AceTypes
+            )
+
+            $newAcl = [System.Security.AccessControl.RawAcl]::new($SourceAcl.Revision, $SourceAcl.Count)
+            $removed = 0
+
+            for ($i = 0; $i -lt $SourceAcl.Count; $i++) {
+                $ace = $SourceAcl[$i]
+
+                # 跳过继承的 ACE（除非显式要求）
+                $isInherited = ($ace.AceFlags -band [System.Security.AccessControl.AceFlags]::Inherited) -ne 0
+                if (-not $IncludeInherited -and $isInherited) {
+                    $null = $newAcl.InsertAce($newAcl.Count, $ace)
+                    continue
+                }
+
+                # 获取 SID
+                $sid = $null
+                if ($ace -is [System.Security.AccessControl.CommonAce]) {
+                    $sid = $ace.SecurityIdentifier
+                } elseif ($ace -is [System.Security.AccessControl.ObjectCommonAce]) {
+                    $sid = $ace.SecurityIdentifier
+                }
+
+                $shouldRemove = $false
+                if ($null -ne $sid) {
+                    if ($AllUnknown) {
+                        try {
+                            $null = $sid.Translate([System.Security.Principal.NTAccount])
+                        } catch {
+                            $shouldRemove = $true
+                        }
+                    } elseif ($null -ne $TargetId -and $sid.Value -eq $TargetId.Value) {
+                        $shouldRemove = $true
+                    }
+                }
+
+                # 按 ACE 类型（Allow / Deny）过滤
+                if ($shouldRemove -and $AceTypes.Length -gt 0) {
+                    $qualifier = [System.Security.AccessControl.AceQualifier]($ace.AceType -as [byte])
+                    $matchesType = $false
+                    foreach ($at in $AceTypes) {
+                        if ($at -eq 'Allow' -and $qualifier -eq [System.Security.AccessControl.AceQualifier]::AccessAllowed) {
+                            $matchesType = $true
+                        } elseif ($at -eq 'Deny' -and $qualifier -eq [System.Security.AccessControl.AceQualifier]::AccessDenied) {
+                            $matchesType = $true
+                        }
+                    }
+                    $shouldRemove = $matchesType
+                }
+
+                if ($shouldRemove) {
+                    $removed++
+                } else {
+                    $null = $newAcl.InsertAce($newAcl.Count, $ace)
+                }
+            }
+
+            return $newAcl, $removed
+        }
+
+        # ---------- 单路径处理 ----------
+        function Invoke-SingleRemove {
+            param(
+                [string]$ResolvedPath,
+                [bool]$WhatIfMode
+            )
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $result = [pscustomobject]@{
+                Path                = $ResolvedPath
+                EntryType           = ''
+                Success             = $false
+                Error               = $null
+                DaclAceReplaced     = 0
+                SaclAceReplaced     = 0
+                OwnerReplaced       = $false
+                GroupReplaced       = $false
+                Written             = $false
+                ElapsedMilliseconds = 0
+            }
+
+            try {
+                $isDir = [System.IO.Directory]::Exists($ResolvedPath)
+                $isFile = [System.IO.File]::Exists($ResolvedPath)
+                if (-not $isDir -and -not $isFile) {
+                    $result.Error = '路径不存在'
+                    return $result
+                }
+                $result.EntryType = if ($isDir) { 'Directory' } else { 'File' }
+
+                $sections = [System.Security.AccessControl.AccessControlSections]::Owner `
+                    -bor [System.Security.AccessControl.AccessControlSections]::Group `
+                    -bor [System.Security.AccessControl.AccessControlSections]::Access
+
+                if ($isDir) {
+                    $sd = [System.Security.AccessControl.DirectorySecurity]::new($ResolvedPath, $sections)
+                } else {
+                    $sd = [System.Security.AccessControl.FileSecurity]::new($ResolvedPath, $sections)
+                }
+
+                $sdBytes = $sd.GetSecurityDescriptorBinaryForm()
+                $rawSd = [System.Security.AccessControl.RawSecurityDescriptor]::new($sdBytes, 0)
+
+                # 移除 DACL 中的匹配 ACE
+                if ($null -ne $rawSd.DiscretionaryAcl) {
+                    $newAcl, $removed = Remove-SidsFromAcl `
+                        -SourceAcl $rawSd.DiscretionaryAcl `
+                        -TargetId $targetId `
+                        -AllUnknown $allUnknown `
+                        -IncludeInherited $IncludeInherited `
+                        -AceTypes $AccessControlType
+                    $result.DaclAceReplaced = $removed
+                    $rawSd.DiscretionaryAcl = $newAcl
+                }
+
+                # Owner / Group 不处理
+
+                $hasChanges = $result.DaclAceReplaced -gt 0
+                if (-not $hasChanges) {
+                    $result.Success = $true
+                    $result.Written = $false
+                    return $result
+                }
+
+                if ($WhatIfMode) {
+                    $result.Success = $true
+                    $result.Written = $false
+                    return $result
+                }
+
+                # 写回
+                $newSdBytes = New-Object byte[] $rawSd.BinaryLength
+                $rawSd.GetBinaryForm($newSdBytes, 0)
+
+                if ($isDir) {
+                    $newSd = [System.Security.AccessControl.DirectorySecurity]::new()
+                    $newSd.SetSecurityDescriptorBinaryForm($newSdBytes)
+                    Set-Acl -Path $ResolvedPath -AclObject $newSd
+                } else {
+                    $newSd = [System.Security.AccessControl.FileSecurity]::new()
+                    $newSd.SetSecurityDescriptorBinaryForm($newSdBytes)
+                    Set-Acl -Path $ResolvedPath -AclObject $newSd
+                }
+
+                $result.Success = $true
+                $result.Written = $true
+            }
+            catch [System.UnauthorizedAccessException] {
+                $result.Error = "访问被拒绝（需要管理员权限）: $($_.Exception.Message)"
+            }
+            catch {
+                $result.Error = $_.Exception.Message
+            }
+            finally {
+                $sw.Stop()
+                $result.ElapsedMilliseconds = $sw.ElapsedMilliseconds
+            }
+            return $result
+        }
+
+        # ---------- 递归遍历 ----------
+        function Invoke-RecursiveRemove {
+            param([string]$RootPath, [bool]$WhatIfMode)
+            $r = Invoke-SingleRemove -ResolvedPath $RootPath -WhatIfMode $WhatIfMode
+            if ($PassThru) { Write-Output $r }
+            if (-not $r.Success) {
+                Write-Warning $r.ToString()
+                if ($StopOnError) { return }
+            } elseif ($r.DaclAceReplaced -gt 0) {
+                Write-Verbose $r.ToString()
+            }
+
+            if (-not $Recurse) { return }
+            if (-not [System.IO.Directory]::Exists($RootPath)) { return }
+
+            $stack = [System.Collections.Generic.Stack[string]]::new()
+            $stack.Push($RootPath)
+
+            while ($stack.Count -gt 0) {
+                $current = $stack.Pop()
+
+                $dirs = @()
+                try {
+                    $dirs = [System.IO.Directory]::EnumerateDirectories($current, '*', [System.IO.SearchOption]::TopDirectoryOnly)
+                } catch { continue }
+
+                foreach ($dir in $dirs) {
+                    if (-not $FollowReparsePoints) {
+                        try {
+                            $attrs = [System.IO.File]::GetAttributes($dir)
+                            if (($attrs -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                        } catch {}
+                    }
+
+                    $r = Invoke-SingleRemove -ResolvedPath $dir -WhatIfMode $WhatIfMode
+                    if ($PassThru) { Write-Output $r }
+                    if (-not $r.Success) {
+                        Write-Warning $r.ToString()
+                        if ($StopOnError) { return }
+                    } elseif ($r.DaclAceReplaced -gt 0) {
+                        Write-Verbose $r.ToString()
+                    }
+                    $stack.Push($dir)
+                }
+
+                $files = @()
+                try {
+                    $files = [System.IO.Directory]::EnumerateFiles($current, '*', [System.IO.SearchOption]::TopDirectoryOnly)
+                } catch { continue }
+
+                foreach ($file in $files) {
+                    $r = Invoke-SingleRemove -ResolvedPath $file -WhatIfMode $WhatIfMode
+                    if ($PassThru) { Write-Output $r }
+                    if (-not $r.Success) {
+                        Write-Warning $r.ToString()
+                        if ($StopOnError) { return }
+                    } elseif ($r.DaclAceReplaced -gt 0) {
+                        Write-Verbose $r.ToString()
+                    }
+                }
+            }
+        }
+    }
+
+    process {
+        foreach ($p in $Path) {
+            $resolved = @()
+            try {
+                $resolved = Resolve-Path -Path $p -ErrorAction Stop | Select-Object -ExpandProperty ProviderPath
+            } catch {
+                Write-Error "无法解析路径 '$p': $($_.Exception.Message)"
+                continue
+            }
+
+            foreach ($rp in $resolved) {
+                $sidDesc = if ($allUnknown) { "所有未知 SID" } else { "$TargetSid" }
+                $whatIf = -not $PSCmdlet.ShouldProcess($rp, "移除 SID $sidDesc 的所有 ACE")
+                if ($Recurse) {
+                    Invoke-RecursiveRemove -RootPath $rp -WhatIfMode $whatIf
+                } else {
+                    $r = Invoke-SingleRemove -ResolvedPath $rp -WhatIfMode $whatIf
+                    if ($PassThru) { Write-Output $r }
+                    if (-not $r.Success) {
+                        Write-Warning $r.ToString()
+                    } elseif ($r.DaclAceReplaced -gt 0) {
+                        Write-Verbose $r.ToString()
+                    }
+                }
+            }
+        }
+    }
+}
+
 # 如果直接运行脚本而非 dot-source，支持 -Path 参数调用
 # 用法示例：
 #   . .\Update-AclSid.ps1
 #   Update-AclSid -Path C:\Data -SourceSid S-1-5-21-... -TargetSid S-1-5-21-... -Recurse -WhatIf
+#   Remove-AclSid -Path C:\Data -TargetSid S-1-5-21-... -Recurse
+#   Remove-AclSid -Path C:\Data -AllUnknownSid -Recurse -WhatIf

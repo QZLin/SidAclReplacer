@@ -1,10 +1,12 @@
 # SidAclReplacer
 
-NTFS ACL SID 替换工具 — 在文件/目录的 ACL 中原地替换安全标识符 (SID)，完整保留 ACE 的所有属性（类型、权限掩码、继承标志、规范顺序）。
+NTFS ACL SID 管理工具 — 在文件/目录的 ACL 中替换或移除安全标识符 (SID)，完整保留 ACE 的所有属性（类型、权限掩码、继承标志、规范顺序）。
 
 ## 功能特性
 
-- **SID 替换** — 将 ACL 中所有匹配 `-SourceSid` 的 ACE 替换为 `-TargetSid`
+- **SID 替换** (`Update-AclSid`) — 将 ACL 中所有匹配 `-SourceSid` 的 ACE 替换为 `-TargetSid`
+- **SID 移除** (`Remove-AclSid`) — 从 ACL 中移除指定 SID 的所有权限记录
+- **孤立 SID 清理** (`Remove-AclSid -AllUnknownSid`) — 清除所有无法解析为账户名的 SID
 - **DACL / SACL 替换** — 支持替换自由访问控制列表和系统审计列表（SACL 需 `SeSecurityPrivilege`）
 - **Owner / Group 替换** — 可选替换对象所有者和主组
 - **递归处理** — 深度优先遍历目录树，流式输出结果
@@ -27,14 +29,20 @@ NTFS ACL SID 替换工具 — 在文件/目录的 ACL 中原地替换安全标�
 
 ## 安装
 
-### 方法一：直接加载模块
+### 方法一：从 PowerShell Gallery 安装（推荐）
+
+```powershell
+Install-Module -Name SidAclReplacer -Force
+```
+
+### 方法二：直接加载模块
 
 ```powershell
 # 克隆或下载项目后，直接导入模块
 Import-Module .\module\SidAclReplacer.psd1
 ```
 
-### 方法二：从源码构建
+### 方法三：从源码构建
 
 ```powershell
 # 需要 .NET SDK（已安装 dotnet 即可）
